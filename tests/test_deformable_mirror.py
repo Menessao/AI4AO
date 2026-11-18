@@ -309,6 +309,8 @@ def test_setter_rebuilds_influence_functions_in_eval_mode(deformable_mirror, dev
     setter must do it itself -- otherwise the DM silently keeps its old shape."""
     if attr == "anamorphosisAngle":  # only has an effect once the two scalings differ
         deformable_mirror.radialScaling = torch.tensor(0.05, device=device)
+    if attr == "moffatParameter":  # only shapes the Moffat IF, not the default TPS
+        deformable_mirror.if_type = "moffat"
     deformable_mirror.eval()
     IF_before = deformable_mirror.IF.clone()
 
@@ -337,7 +339,7 @@ def test_influence_function_couples_at_one_actuator_pitch(tiny_wfs_params, tiny_
     the pitch being the actual actuator spacing Nres / (Nact - 1)."""
     # beta = 1e3: Gaussian to ~3e-4 of the amplitude, yet small enough that
     # (1 + r2 / beta) ** beta stays accurate in float32
-    params = dict(tiny_dm_params, moffatParam=1e3, MechCoupling=0.3)
+    params = dict(tiny_dm_params, IFType="moffat", moffatParam=1e3, MechCoupling=0.3)
     dm = DeformableMirror(tiny_wfs_params(), params, device)
     dm.eval()
 
@@ -400,7 +402,7 @@ def test_get_actuator_positions_matches_influence_function_centres(tiny_wfs_para
     where MakeZonalModes centres each influence function."""
     wfs_params = dict(tiny_wfs_params(), Nres=40)
     dm_params = dict(tiny_dm_params, Nactuator=9, moffatParam=50.0, MechCoupling=0.2,
-                     FlipLeftRight=flip_lr, FlipTopBottom=flip_tb)
+                     FlipLeftRight=flip_lr, FlipTopBottom=flip_tb, IFType="moffat")
     misreg = dict(rotationAngle=17.0, shiftX=0.03, shiftY=-0.02, anamorphosisAngle=25.0,
                   tangentialScaling=4.0, radialScaling=-3.0)
     dm = DeformableMirror(wfs_params, dm_params, device, misreg=misreg)
@@ -424,3 +426,191 @@ def test_get_actuator_positions_is_differentiable(deformable_mirror):
     for name in ("_rotationAngle", "_grid_shift", "_radialScaling", "_tangentialScaling"):
         grad = getattr(deformable_mirror, name).grad
         assert grad is not None and grad.abs().sum() > 0, name
+
+
+# ---------------------------------------------------------------------------
+# Thin-plate-spline influence functions (IFType="tps", the default)
+# ---------------------------------------------------------------------------
+
+def _on_pixel_misreg(wfs_params):
+    """Half-pixel shift: with an integer pitch it puts every actuator centre
+    exactly on a pupil-pixel centre (where r = 0 in the TPS kernel)."""
+    half_pixel = 0.5 * wfs_params["D"] / wfs_params["Nres"]
+    return dict(rotationAngle=0.0, shiftX=half_pixel, shiftY=half_pixel, anamorphosisAngle=0.0,
+                radialScaling=0.0, tangentialScaling=0.0)
+
+
+def _node_pixels(dm):
+    """(row, col) of the pixel under each actuator, and which ones are on the grid."""
+    pos = dm.GetActuatorPositions().detach()
+    col = (pos[:, 0] + dm.Nres / 2 - 0.5).round().long()
+    row = (pos[:, 1] + dm.Nres / 2 - 0.5).round().long()
+    on_grid = (row >= 0) & (row < dm.Nres) & (col >= 0) & (col < dm.Nres)
+    return row, col, on_grid
+
+
+def test_tps_is_the_default_if_type(deformable_mirror):
+    assert deformable_mirror.if_type == "tps"
+    assert deformable_mirror.GetMisreg()[1]["IFType"] == "tps"
+
+
+def test_invalid_if_type_raises(tiny_wfs_params, tiny_dm_params, device):
+    with pytest.raises(ValueError):
+        DeformableMirror(tiny_wfs_params(), dict(tiny_dm_params, IFType="spline"), device)
+
+
+def test_tps_moffat_param_is_optional(tiny_wfs_params, tiny_dm_params, device):
+    params = {k: v for k, v in tiny_dm_params.items() if k != "moffatParam"}
+    dm = DeformableMirror(tiny_wfs_params(), params, device)
+    assert torch.isfinite(dm.IF).all()
+
+
+@pytest.mark.parametrize("coupling", [0.1, 0.3])
+def test_tps_interpolates_coupling_pattern_at_nodes(tiny_wfs_params, tiny_dm_params, device, coupling):
+    """Before pupil masking, IF_j at node i is mechCoupling ** (d_ij / pitch)^2:
+    1 on its own actuator, mechCoupling on the nearest neighbours."""
+    wfs_params = dict(tiny_wfs_params(), Nres=24)
+    dm = DeformableMirror(wfs_params, dict(tiny_dm_params, MechCoupling=coupling), device,
+                          misreg=_on_pixel_misreg(wfs_params))
+    with torch.no_grad():
+        raw = dm._ThinPlateSplineIF(dm.mechCoupling)
+    row, col, on_grid = _node_pixels(dm)
+    assert on_grid.sum() >= 9
+
+    d2 = torch.cdist(dm.actuator_positions, dm.actuator_positions) ** 2 / dm.pitch ** 2
+    expected = coupling ** d2[:, on_grid]
+    assert torch.allclose(raw[:, row[on_grid], col[on_grid]], expected, atol=1e-4)
+
+
+def test_tps_if_is_bounded_in_pupil(tiny_wfs_params, tiny_dm_params, device):
+    wfs_params = dict(tiny_wfs_params(), Nres=40)
+    dm = DeformableMirror(wfs_params, dict(tiny_dm_params, Nactuator=9, MechCoupling=0.2), device)
+    with torch.no_grad():
+        raw = dm._ThinPlateSplineIF(dm.mechCoupling)
+    assert raw[:, dm.pupil].abs().max() <= 1.0 + 1e-3
+
+
+def test_tps_gradients_finite_with_actuators_on_pixels(tiny_wfs_params, tiny_dm_params, device):
+    """r^2 ln r is 0 * log(0) at r = 0: the kernel must give finite gradients
+    when a pixel sits exactly on an actuator (and on the K diagonal)."""
+    wfs_params = dict(tiny_wfs_params(), Nres=24)
+    misreg = dict(_on_pixel_misreg(wfs_params), radialScaling=0.0)
+    dm = DeformableMirror(wfs_params, tiny_dm_params, device, misreg=misreg).train()
+    row, col, on_grid = _node_pixels(dm)
+    assert on_grid.any()
+
+    coefs = torch.randn(2, int(dm.totalAct), device=device)
+    dm(coefs).pow(2).sum().backward()
+    for name, param in dm.named_parameters():
+        if name == "_moffatParameter":
+            assert param.grad is None  # unused by the TPS IF
+            continue
+        assert param.grad is not None, f"{name} got no gradient"
+        assert torch.isfinite(param.grad).all(), name
+
+
+def test_tps_kernel_value_and_gradient_at_zero():
+    r2 = torch.tensor([0.0, 1.0, 4.0], dtype=torch.float64, requires_grad=True)
+    phi = DeformableMirror._TPSKernel(r2)
+    assert torch.allclose(phi.detach(), torch.tensor([0.0, 0.0, 2.0 * torch.log(torch.tensor(4.0)).item()],
+                                                     dtype=torch.float64))
+    phi.sum().backward()
+    # d/dr2 [r2 ln(r2) / 2] = (ln(r2) + 1) / 2, and 0 (not NaN) at r2 = 0
+    expected = torch.tensor([0.0, 0.5, (torch.log(torch.tensor(4.0)).item() + 1) / 2], dtype=torch.float64)
+    assert torch.allclose(r2.grad, expected)
+
+
+@pytest.fixture
+def float64_default():
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    yield
+    torch.set_default_dtype(previous)
+
+
+def test_tps_gradcheck_geometry_and_coupling(tiny_wfs_params, tiny_dm_params, float64_default):
+    """Analytic gradients of the TPS IF match finite differences for every
+    geometry parameter and the coupling (float64 DM, generic misregistration)."""
+    misreg = dict(rotationAngle=7.0, shiftX=0.03, shiftY=-0.02, anamorphosisAngle=25.0,
+                  radialScaling=3.0, tangentialScaling=-2.0)
+    dm = DeformableMirror(tiny_wfs_params(), dict(tiny_dm_params, MechCoupling=0.3), "cpu", misreg=misreg)
+    dm.per_actuator_calibration = True
+    names = ["_rotationAngle", "_grid_shift", "_radialScaling", "_tangentialScaling",
+             "_anamorphosisAngle", "_mechCoupling"]
+    originals = {n: getattr(dm, n) for n in names}
+    probe = torch.randn(int(dm.totalAct), dm.Nres, dm.Nres)
+
+    def loss(*values):
+        for n, v in zip(names, values):
+            dm._parameters[n] = v
+        dm.MakeZonalModes()
+        return (dm.IF / 1e-5 * probe).sum()
+
+    inputs = tuple(originals[n].detach().clone().requires_grad_() for n in names)
+    try:
+        assert torch.autograd.gradcheck(loss, inputs, eps=1e-6, atol=1e-5, rtol=1e-4)
+    finally:
+        for n in names:
+            dm._parameters[n] = originals[n]
+
+
+def test_tps_per_actuator_coupling_only_changes_that_actuator(tiny_wfs_params, tiny_dm_params, device):
+    dm = DeformableMirror(tiny_wfs_params(), tiny_dm_params, device).eval()
+    dm.per_actuator_calibration = True
+    IF_before = dm.IF.clone()
+
+    coupling = dm.mechCoupling.detach().clone()
+    coupling[3] = 0.1
+    dm.mechCoupling = coupling
+
+    changed = ~torch.isclose(dm.IF, IF_before, atol=1e-12).flatten(start_dim=1).all(dim=-1)
+    assert changed.tolist() == [i == 3 for i in range(int(dm.totalAct))]
+
+
+def test_save_load_keeps_if_type_and_old_checkpoints_load_as_moffat(tiny_wfs_params, tiny_dm_params, device, tmp_path):
+    moffat = DeformableMirror(tiny_wfs_params(), dict(tiny_dm_params, IFType="moffat"), device)
+    path = tmp_path / "moffat.pth"
+    moffat.SaveCalibration(str(path))
+    assert torch.load(path)["if_type"] == "moffat"
+
+    fresh = DeformableMirror(tiny_wfs_params(), tiny_dm_params, device)
+    assert fresh.if_type == "tps"
+    fresh.LoadCalibration(str(path))
+    assert fresh.if_type == "moffat"
+    assert torch.allclose(fresh.IF, moffat.IF, atol=1e-12)
+
+    # Checkpoints from before IFType existed were fit with Moffat IFs.
+    checkpoint = torch.load(path)
+    del checkpoint["if_type"]
+    legacy_path = tmp_path / "legacy.pth"
+    torch.save(checkpoint, legacy_path)
+    legacy = DeformableMirror(tiny_wfs_params(), tiny_dm_params, device)
+    legacy.LoadCalibration(str(legacy_path))
+    assert legacy.if_type == "moffat"
+    assert torch.allclose(legacy.IF, moffat.IF, atol=1e-12)
+
+
+@pytest.mark.parametrize("flip_lr,flip_tb", [(False, False), (True, False), (False, True), (True, True)])
+def test_tps_follows_misregistration(tiny_wfs_params, tiny_dm_params, device, flip_lr, flip_tb):
+    """Under rotation, shift, anamorphosis and flips, the raw TPS IF_j sampled
+    at the (misregistered) actuator positions is still the coupling pattern:
+    1 on actuator j, mechCoupling on its nearest neighbours."""
+    wfs_params = dict(tiny_wfs_params(), Nres=40)
+    dm_params = dict(tiny_dm_params, Nactuator=9, MechCoupling=0.2, FlipLeftRight=flip_lr, FlipTopBottom=flip_tb)
+    misreg = dict(rotationAngle=17.0, shiftX=0.03, shiftY=-0.02, anamorphosisAngle=25.0,
+                  tangentialScaling=4.0, radialScaling=-3.0)
+    dm = DeformableMirror(wfs_params, dm_params, device, misreg=misreg).eval()
+    with torch.no_grad():
+        raw = dm._ThinPlateSplineIF(dm.mechCoupling)
+        positions = dm.GetActuatorPositions()
+    interior = positions.norm(dim=-1) < 0.35 * dm.Nres
+    assert interior.sum() >= 9
+
+    # bilinear sampling of every IF at every interior actuator position
+    grid = (positions[interior] / (dm.Nres / 2)).view(1, 1, -1, 2).expand(raw.shape[0], 1, -1, 2)
+    sampled = torch.nn.functional.grid_sample(raw[:, None], grid, align_corners=False)[:, 0, 0]
+
+    d2 = torch.cdist(dm.actuator_positions, dm.actuator_positions)[:, interior] ** 2 / dm.pitch ** 2
+    expected = 0.2 ** d2
+    # atol covers bilinear sampling flattening the peak (~4% at this pitch)
+    assert torch.allclose(sampled[interior], expected[interior], atol=0.06)

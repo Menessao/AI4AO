@@ -58,10 +58,13 @@ def test_z_inv_is_pseudo_inverse_of_dm_basis(deformable_mirror, device):
     trainer, M2C, total_act = _build_minimal_trainer(deformable_mirror, device)
 
     IF_flat = deformable_mirror(M2C.T).flatten(start_dim=-2)
-    identity_check = IF_flat @ trainer.z_inv
 
     assert trainer.z_inv.shape == (deformable_mirror.Nres * deformable_mirror.Nres, total_act)
-    assert torch.allclose(identity_check, torch.eye(total_act, device=device), atol=1e-3)
+    # Penrose condition A A+ A = A rather than A A+ = I: the zonal TPS basis
+    # has one invisible command (C^-1 1, a pure piston removed in the pupil),
+    # so it is rank totalAct - 1.
+    scale = IF_flat.abs().max()
+    assert torch.allclose(IF_flat @ trainer.z_inv @ IF_flat / scale, IF_flat / scale, atol=1e-3)
 
 
 def test_save_and_load_checkpoint_round_trip(deformable_mirror, device, tmp_path):

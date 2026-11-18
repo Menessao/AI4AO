@@ -1,6 +1,7 @@
 """Differentiability is a first-class, non-negotiable constraint anywhere in
 the OPD -> WFS/mask -> DM -> loss chain per CLAUDE.md. These tests check
 gradient flow explicitly, distinct from "does it run" coverage elsewhere."""
+import pytest
 import torch
 import torch.nn as nn
 
@@ -99,7 +100,12 @@ def test_gradient_flows_through_polychromatic_get_psf(pyramid_wfs, device):
     assert torch.isfinite(wavelength.grad).all()
 
 
-def test_gradient_flows_through_deformable_mirror_to_coefs_and_misreg(deformable_mirror, device):
+@pytest.mark.parametrize("if_type,params", [
+    ("tps", ["_rotationAngle", "_grid_shift", "_radialScaling", "_sign", "_mechCoupling"]),
+    ("moffat", ["_rotationAngle", "_sign", "_moffatParameter", "_mechCoupling"]),
+])
+def test_gradient_flows_through_deformable_mirror_to_coefs_and_misreg(deformable_mirror, device, if_type, params):
+    deformable_mirror.if_type = if_type
     deformable_mirror.train()
     total_act = int(deformable_mirror.totalAct.item())
     coefs = torch.randn(2, total_act, device=device, requires_grad=True)
@@ -110,7 +116,7 @@ def test_gradient_flows_through_deformable_mirror_to_coefs_and_misreg(deformable
     assert coefs.grad is not None
     assert torch.isfinite(coefs.grad).all()
 
-    for name in ["_rotationAngle", "_sign", "_moffatParameter", "_mechCoupling"]:
+    for name in params:
         param = getattr(deformable_mirror, name)
         assert param.grad is not None, f"{name} got no gradient"
         assert torch.isfinite(param.grad).all()

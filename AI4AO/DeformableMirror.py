@@ -10,9 +10,11 @@ class DeformableMirror(nn.Module):
     Deformable mirror: zonal commands to a mirror surface (OPD, meters).
 
     Actuators sit on an ``Nactuator x Nactuator`` grid clipped to the pupil
-    (``totalAct`` of them), each with a Moffat influence function
-    (``moffatParam``, ``MechCoupling``) and stroke ``signedAmplitude`` (m per
-    unit command). ``forward(coefs)`` maps commands (B, totalAct) to surfaces
+    (``totalAct`` of them), each with an influence function of type
+    ``IFType``: ``"tps"`` (default, thin-plate spline through the actuator
+    nodes, equal to ``MechCoupling`` at the nearest neighbours) or
+    ``"moffat"`` (``moffatParam``, ``MechCoupling``), and stroke
+    ``signedAmplitude`` (m per unit command). ``forward(coefs)`` maps commands (B, totalAct) to surfaces
     (B, Nres, Nres). ``MakeZernikeM2C()`` gives the modes-to-commands matrix
     (totalAct, Nmodes) of a Zernike basis in which a coefficient of 1 is 1 rad
     RMS at the sensing wavelength.
@@ -70,6 +72,12 @@ class DeformableMirror(nn.Module):
         # totalAct vector regardless of this flag.
         self.per_actuator_calibration = per_actuator_calibration
 
+        # Influence-function model: "tps" (thin-plate spline, default) or
+        # "moffat" (whose Gaussian limit is a large moffatParam).
+        self.if_type = DMDict.get("IFType", "tps")
+        if self.if_type not in ("tps", "moffat"):
+            raise ValueError(f"IFType must be 'tps' or 'moffat', got {self.if_type!r}.")
+
         self._rotationAngle = nn.Parameter(torch.empty(1, device=self.device))
         self._grid_shift = nn.Parameter(torch.empty((1,2,1,1), device=self.device))
         self._radialScaling = nn.Parameter(torch.empty(1, device=self.device))
@@ -86,7 +94,9 @@ class DeformableMirror(nn.Module):
         self._sign = nn.Parameter(torch.empty(self.totalAct, device=self.device))
         self._mechCoupling = nn.Parameter(torch.empty(self.totalAct, device=self.device))
 
-        self.moffatParameter = torch.tensor([DMDict["moffatParam"]], device=self.device, dtype=torch.float32)
+        # Only used by the "moffat" IF, but always kept so the state_dict layout
+        # does not depend on the IF model.
+        self.moffatParameter = torch.tensor([DMDict.get("moffatParam", 2.0)], device=self.device, dtype=torch.float32)
         self.sign = torch.tensor([DMDict["signedAmplitude"]], device=self.device, dtype=torch.float32)
         self.mechCoupling = torch.tensor([DMDict["MechCoupling"]], device=self.device, dtype=torch.float32)
 
@@ -215,6 +225,15 @@ class DeformableMirror(nn.Module):
         effective_moffat = self._CollapseIfGlobal(self._moffatParameter, torch.exp).view(-1, 1, 1)
         effective_mech = self._CollapseIfGlobal(self._mechCoupling, torch.sigmoid).view(-1, 1, 1)
 
+        if self.if_type == "tps":
+            self.IF = effective_sign * self._ThinPlateSplineIF(effective_mech.view(-1))
+        else:
+            self.IF = effective_sign * self._MoffatIF(X, Y, effective_moffat, effective_mech)
+
+        self.IF *= self.pupil
+        self.IF[:, self.pupil] -= self.IF[:, self.pupil].mean(dim=(-1), keepdim=True)
+
+    def _MoffatIF(self, X, Y, effective_moffat, effective_mech):
         # Width chosen so the IF equals mechCoupling one pitch away from its actuator
         # (exactly so in the Gaussian limit of the Moffat profile).
         cx = (1+self.radialScaling)*self.pitch/torch.sqrt(2*torch.log(1./effective_mech))
@@ -230,10 +249,57 @@ class DeformableMirror(nn.Module):
 
         r2 = (a*X**2 + 2*b*X*Y + c*Y**2)
 
-        self.IF = effective_sign * 1 / (1 + r2/effective_moffat)**effective_moffat
+        return 1 / (1 + r2/effective_moffat)**effective_moffat
 
-        self.IF *= self.pupil
-        self.IF[:, self.pupil] -= self.IF[:, self.pupil].mean(dim=(-1), keepdim=True)
+    @staticmethod
+    def _TPSKernel(r2):
+        # r^2 ln r = r2 ln(r2) / 2, written in r2 so no sqrt is needed. The
+        # where() keeps the value AND its gradient exactly 0 at r = 0 (a pixel
+        # on an actuator, or a node with itself) instead of 0 * log(0) = NaN.
+        return 0.5 * r2 * torch.log(torch.where(r2 > 0, r2, torch.ones_like(r2)))
+
+    def _ThinPlateSplineIF(self, effective_mech):
+        """
+        Unit-amplitude thin-plate-spline influence functions (totalAct, Nres, Nres).
+
+        IF_j is the minimum-bending-energy surface (kernel r^2 ln r plus an
+        affine part) through the actuator nodes, taking the value
+        mechCoupling_j ** (d_ij / pitch)^2 at node i: 1 on its own actuator,
+        mechCoupling on the nearest neighbours, mechCoupling^2 on the
+        diagonals, as in the Gaussian limit of the Moffat profile.
+
+        Everything is computed in the DM frame, in pitch units: the pupil
+        pixels are mapped back through the inverse of the shift, flips,
+        rotation and anamorphosis applied to the actuators, so the nodes keep
+        their nominal unit spacing and only the evaluation points depend on
+        the misregistration.
+        """
+        nodes = self.actuator_positions / self.pitch                               # (N, 2)
+
+        # Linear part A of pupil = A @ dm + shift, from the same transforms
+        # GetActuatorPositions applies (row vectors: x @ A.T).
+        eye = torch.eye(2, device=self.device)
+        A_T = self.rotate_coordinates(self.anamorphosis_coordinates(eye)) * self.flip_matrix[0, :, 0, 0]
+        pixels = self.positions[0].flatten(start_dim=1).T - self.grid_shift[0, :, 0, 0]   # (Nres^2, 2)
+        u = pixels @ torch.linalg.inv(A_T) / self.pitch                                    # (Nres^2, 2)
+
+        # Interpolation system [[K, P], [P^T, 0]] [W; a] = [C; 0], in float64
+        # because the TPS system is only moderately well conditioned.
+        nodes64 = nodes.double()
+        node_d2 = ((nodes64[:, None, :] - nodes64[None, :, :])**2).sum(dim=-1)            # (N, N)
+        N = nodes.shape[0]
+        P = torch.cat((torch.ones(N, 1, dtype=torch.float64, device=self.device), nodes64), dim=1)
+        L = torch.zeros(N + 3, N + 3, dtype=torch.float64, device=self.device)
+        L[:N, :N] = self._TPSKernel(node_d2)
+        L[:N, N:] = P
+        L[N:, :N] = P.T
+        C = torch.exp(node_d2 * torch.log(effective_mech.double())[None, :])              # column j: IF_j at the nodes
+        rhs = torch.cat((C, torch.zeros(3, N, dtype=torch.float64, device=self.device)), dim=0)
+        weights = torch.linalg.solve(L, rhs).to(nodes.dtype)                              # (N + 3, N)
+
+        pix_d2 = ((u[:, None, :] - nodes[None, :, :])**2).sum(dim=-1)                     # (Nres^2, N)
+        IF = self._TPSKernel(pix_d2) @ weights[:N] + u @ weights[N + 1:] + weights[N]
+        return IF.T.reshape(N, self.Nres, self.Nres)
 
 
     def GetMisreg(self):
@@ -261,6 +327,7 @@ class DeformableMirror(nn.Module):
         DMDict["moffatParam"] = self.moffatParameter.detach().mean().cpu().item()
         DMDict["signedAmplitude"] = self.sign.detach().mean().cpu().item()
         DMDict["MechCoupling"] = self.mechCoupling.detach().mean().cpu().item()
+        DMDict["IFType"] = self.if_type
         DMDict["FlipLeftRight"] = self.flip_lr
         DMDict["FlipTopBottom"] = self.flip_tb
         DMDict["offset_to_fit_number_of_actuators"] = self.offset_to_fit_number_of_actuators
@@ -344,6 +411,8 @@ class DeformableMirror(nn.Module):
         self.flip_tb = DMDict["FlipTopBottom"]
         self.offset_to_fit_number_of_actuators = DMDict["offset_to_fit_number_of_actuators"]
         self.per_actuator_calibration = checkpoint.get("per_actuator_calibration", False)
+        # Checkpoints from before the TPS model were all fit with Moffat IFs.
+        self.if_type = checkpoint.get("if_type", "moffat")
 
         self.load_state_dict(model)
 
@@ -373,6 +442,7 @@ class DeformableMirror(nn.Module):
         "misreg": misreg,
         "per_actuator_calibration": self.per_actuator_calibration,
         "if_width_pitch": "Nres/(Nact-1)",
+        "if_type": self.if_type,
             }, file_path)
 
 
