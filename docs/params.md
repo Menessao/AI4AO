@@ -79,7 +79,8 @@ These keys shape the temporal evolution and, in closed-loop mode
 |---|---|---|---|
 | `Nactuator` | int | Actuators across the diameter (an `Nactuator × Nactuator` grid clipped to the pupil). Also sets the correctable band of the closed-loop residual. | DM, PhaseDataset, PSFDataset |
 | `Nmodes` | int | Default number of modes of `MakeZernikeM2C`, and so the reconstructor's output size | DM |
-| `moffatParam` | float | Moffat exponent of the influence functions | DM |
+| `IFType` | `"tps"` / `"moffat"` | Influence-function model: thin-plate spline through the actuator nodes (default) or Moffat profile | DM |
+| `moffatParam` | float | Moffat exponent of the influence functions (`IFType="moffat"` only; optional otherwise) | DM |
 | `signedAmplitude` | m | Stroke per unit command. A negative sign flips the DM response. | DM |
 | `MechCoupling` | fraction | Mechanical coupling: an actuator's influence at its neighbors | DM |
 | `FlipLeftRight`, `FlipTopBottom` | bool | Mirror the actuator grid | DM |

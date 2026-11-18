@@ -18,7 +18,7 @@ WFSParams = dict(
         "Nres":40,
         "sampling":140/40,
         "D": 1.82,
-        "centralObstruction": 0.3,
+        "centralObstruction": 0.33,
         "useNoise": True,
         "Modulation": 0,
         "Wavelength": 635e-9,
